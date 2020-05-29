@@ -1,342 +1,338 @@
-/*
- * il processo principale crea un file "output.txt" di dimensione FILE_SIZE (all'inizio ogni byte del file deve avere valore 0)
-
- #define FILE_SIZE (1024*1024)
-
- #define N 4
- è dato un semaforo senza nome: proc_sem
-
- il processo principale crea N processi figli
-
- i processi figli aspettano al semaforo proc_sem.
-
- ogni volta che il processo i-mo riceve semaforo "verde", cerca il primo byte del file che abbia valore 0 e ci scrive il valore ('A' + i). La scrittura su file è concorrente e quindi va gestita opportunamente (ad es. con un mutex).
-
- se il processo i-mo non trova una posizione in cui poter scrivere il valore, allora termina.
-
- il processo padre:
-
- per (FILE_SIZE+N) volte, incrementa il semaforo proc_sem
-
- aspetta i processi figli e poi termina.
-
- risolvere il problema in due modi:
-
- soluzione A:
-
- usare le system call open(), lseek(), write()
-
- soluzione B:
-
- usare le system call open(), mmap()
- */
-#include <unistd.h>
-#include <stdio.h>
 #include <stdlib.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <errno.h>
+#include <semaphore.h>
+#include <stdio.h>
 #include <string.h>
-
+#include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 
-#include <errno.h>
-#include <pthread.h>
-#include <semaphore.h>
-
-
-#define FILE_SIZE (1024*1024)
-#define N 4
-
-sem_t * proc_sem;
-sem_t *mutex;
-
-char * file_name_A = "output_A.txt";
-char * file_name_B = "output_B.txt";
-
-void create_file_set_size(char *file_name, unsigned int file_size);
-void solution_A();
-void solution_B();
-
-void child_process_solution_A(int i);
-
 #define CHECK_ERR(a,msg) {if ((a) == -1) { perror((msg)); exit(EXIT_FAILURE); } }
+
 #define CHECK_ERR_MMAP(a,msg) {if ((a) == MAP_FAILED) { perror((msg)); exit(EXIT_FAILURE); } }
 
-//#define DEBUG_MSG
+#define FILE_SIZE (1024*1024)
 
-int main(int argc, char *argv[]) {
+#define N 4
 
-	int res;
+sem_t *proc_sem;
 
-	proc_sem = mmap(NULL, // NULL: è il kernel a scegliere l'indirizzo
-			sizeof(sem_t) * 2, // dimensione della memory map
-			PROT_READ | PROT_WRITE, // memory map leggibile e scrivibile
-			MAP_SHARED | MAP_ANONYMOUS, // memory map condivisibile con altri processi e senza file di appoggio
-			-1, 0); // offset nel file
-	CHECK_ERR_MMAP(proc_sem, "mmap")
+sem_t *gettone;
 
-	mutex = proc_sem + 1;
-	res = sem_init(proc_sem,
-			1, // 1 => il semaforo è condiviso tra processi, 0 => il semaforo è condiviso tra threads del processo
-			0 // valore iniziale del semaforo
-			);
-	CHECK_ERR(res, "sem_init")
+void child_process_A(int i) {
 
-	res = sem_init(mutex,
-			1, // 1 => il semaforo è condiviso tra processi, 0 => il semaforo è condiviso tra threads del processo
-			1 // valore iniziale del semaforo (se mettiamo 0 che succede?)
-			);
-	CHECK_ERR(res, "sem_init")
-
-	printf("ora avvio la soluzione_A()...\n");
-	solution_A();
-
-	printf("\n\n");
-
-	printf("ed ora avvio la soluzione_B()...\n");
-	solution_B();
-
-	res = sem_destroy(proc_sem);
-	CHECK_ERR(res, "sem_destroy")
-
-	res = sem_destroy(mutex);
-	CHECK_ERR(res, "sem_destroy")
-
-	printf("bye!\n");
-	return 0;
-}
-
-void solution_A() {
-//	usare le system call open(), lseek(), write()
-
-	create_file_set_size(file_name_A, FILE_SIZE);
-
-	// creiamo N processi
-	for (int i = 0; i < N; i++) {
-		switch (fork()) {
-			case 0:
-
-				child_process_solution_A(i);
-
-				break;
-			case -1:
-				perror("fork()");
-				exit(EXIT_FAILURE);
-			default:
-			;
-		}
-	}
-
-	for (int i = 0; i < FILE_SIZE + N; i++) {
-		if (sem_post(proc_sem) == -1) {
-			perror("sem_post");
-			exit(EXIT_FAILURE);
-		}
-	}
-
-	while (wait(NULL) != -1) ;
-
-	printf("[parent] solution A - bye\n");
-
-}
-
-
-void solution_B() {
-
+	//int volta=0;
+	int bytes = 0;
 	int fd;
-	char ch2write;
-	int exit_while = 0;
-
-	char * data;
-	char * ptr;
-
-	// quanti byte ha scritto il processo figlio
-	int write_counter = 0;
-
-	create_file_set_size(file_name_B, FILE_SIZE);
-
-	fd = open(file_name_B, O_RDWR);
-
-	// unica memory map condivisa tra i processi
-	data = mmap(NULL,
-			FILE_SIZE,
-			PROT_READ | PROT_WRITE, // memory map leggibile e scrivibile
-			MAP_SHARED,
-			fd,
-			0
-			);
-
-	if (data == MAP_FAILED) {
-		perror("mmap()");
-		exit(EXIT_FAILURE);
-	}
-
-	close(fd);
-
-	ptr = data;
-
-	// creiamo N processi
-	for (int i = 0; i < N; i++) {
-		switch (fork()) {
-			case 0:
-
-				ch2write = 'A' + i;
-
-				while (!exit_while) {
-
-					if (sem_wait(proc_sem) == -1) {
-						perror("sem_wait");
-						exit(EXIT_FAILURE);
-					}
-					// se siamo qui, possiamo scrivere un byte nel file (se c'è spazio)
-
-					if (sem_wait(mutex) == -1) {
-						perror("sem_wait");
-						exit(EXIT_FAILURE);
-					}
-
-					// cerchiamo la prossima posizione libera (ch == 0)
-					while (*ptr != 0 && ptr - data < FILE_SIZE)
-						ptr++;
-
-					if (ptr - data == FILE_SIZE) {
-						// non c'è una posizione libera in cui poter scrivere nel file
-						// usciamo dal while e terminiamo
-						printf("[child %d] EOF\n", i);
-
-						exit_while = 1;
-					} else {
-						// ok, abbiamo trovato una posizione dove scrivere il carattere
-#ifdef DEBUG_MSG
-						printf("[child %d] scrivo nel file all'offset %ld\n", i, ptr - data);
-#endif
-
-						*ptr = ch2write;
-						ptr++;
-
-						write_counter++;
-					}
-
-					if (sem_post(mutex) == -1) {
-						perror("sem_post");
-						exit(EXIT_FAILURE);
-					}
-
-				}
-
-				printf("[child %d] bye  write_counter=%d\n", i, write_counter);
-
-				exit(EXIT_SUCCESS);
-
-				break;
-			case -1:
-				perror("fork()");
-				exit(EXIT_FAILURE);
-			default:
-			;
-		}
-	}
-
-	for (int i = 0; i < FILE_SIZE + N; i++) {
-		if (sem_post(proc_sem) == -1) {
-			perror("sem_post");
-			exit(EXIT_FAILURE);
-		}
-	}
-
-	while (wait(NULL) != -1) ;
-
-	printf("[parent] solution B - bye\n");
-
-}
-
-/*
- * crea il file e lo apre in lettura e scrittura, imposta la dimensione del file
- *
- */
-void create_file_set_size(char *file_name, unsigned int file_size) {
-	int res;
-	int fd = open(file_name,
-	O_CREAT | O_TRUNC | O_RDWR, // apriamo il file in lettura e scrittura
-	S_IRUSR | S_IWUSR // l'utente proprietario del file avrà i permessi di lettura e scrittura sul nuovo file
-	);
-
-	CHECK_ERR(fd, "open file")
-
-	res = ftruncate(fd, file_size);
-	CHECK_ERR(res, "ftruncate()")
-
-	close(fd);
-}
-
-
-void child_process_solution_A(int i) {
-	int fd;
-	int res;
-	char ch, ch2write;
+	int read_res;
+	int write_res;
+	char read_buffer[1];
+	char write_buffer[1];
 	off_t file_offset;
-	int exit_while = 0;
 
-	// quanti byte ha scritto il processo figlio
-	int write_counter = 0;
+	write_buffer[0] = 'A' + i;
 
-	ch2write = 'A' + i;
+	fd = open("output_A.txt", O_RDWR);
 
-	fd = open(file_name_A, O_RDWR);
+	CHECK_ERR(fd, "open")
 
-	while (!exit_while) {
+	while (1) {
 
 		if (sem_wait(proc_sem) == -1) {
 			perror("sem_wait");
 			exit(EXIT_FAILURE);
 		}
-		// se siamo qui, possiamo scrivere un byte nel file (se c'è spazio)
 
-		if (sem_wait(mutex) == -1) {
+		//volta++
+
+		//printf("figlio %d: sono passato dal semaforo per la %d volta\n", i, volta);
+
+		//qui comincio ad accedere al file
+
+		if (sem_wait(gettone) == -1) {
 			perror("sem_wait");
 			exit(EXIT_FAILURE);
 		}
 
-		// cerchiamo la prossima posizione libera (ch == 0)
-		// read restituisce 0 in caso di EOF
-		while ((res = read(fd, &ch, 1)) > 0 && ch != 0) ;
-
-		// ok, abbiamo trovato una posizione dove scrivere il carattere
-		if (res == 1) {
-			// spostiamo il file offset indietro di -1
-			// perchè ogni read avanza di 1 byte
-			file_offset = lseek(fd, -1, SEEK_CUR);
-
-#ifdef DEBUG_MSG
-			printf("[child %d] scrivo nel file all'offset %ld\n", i, file_offset);
-#endif
-			res = write(fd, &ch2write, sizeof(ch2write));
-			CHECK_ERR(res, "write()")
-
-			write_counter++;
-
-		} else {
-			// non c'è una posizione libera in cui poter scrivere nel file
-			// usciamo dal while e terminiamo
-			printf("[child %d] EOF\n", i);
-
-			exit_while = 1;
+		while ((read_res = read(fd, read_buffer, sizeof(char))) > 0) { //esco dal while per un errore in lettura o per EOF
+			if (read_buffer[0] == '\0') { //ho trovato uno zero
+				file_offset = lseek(fd, -1, SEEK_CUR); //mi sposto indietro di uno per sovrascrivere lo zero appena trovato
+				CHECK_ERR(file_offset, "lseek")
+				write_res = write(fd, write_buffer, sizeof(char)); //scrivo
+				CHECK_ERR(write_res, "write")
+				bytes++;
+				break;
+			}
 		}
 
-		if (sem_post(mutex) == -1) {
+		CHECK_ERR(read_res, "read")
+
+		if (read_res == 0) {
+			printf(
+					"figlio %d, ho finito il file senza trovarci zeri, ho scritto %d volte\n",
+					i, bytes);
+
+			if (sem_post(gettone) == -1) {
+				perror("sem_wait");
+				exit(EXIT_FAILURE);
+			}
+
+			exit(EXIT_SUCCESS);
+		}
+
+		if (sem_post(gettone) == -1) {
+			perror("sem_wait");
+			exit(EXIT_FAILURE);
+		}
+	}
+}
+
+void soluzione_A(void) {
+
+	int fd;
+	int res;
+
+	//padre crea il file
+	fd = open("output_A.txt",
+	O_CREAT | O_TRUNC | O_RDWR,
+	S_IRUSR | S_IWUSR // l'utente proprietario del file avrà i permessi di lettura e scrittura sul nuovo file
+	);
+
+	CHECK_ERR(fd, "open")
+
+	res = ftruncate(fd, FILE_SIZE);
+
+	CHECK_ERR(fd, "ftruncate")
+
+	res = close(fd);
+
+	CHECK_ERR(res, "close")
+
+	//semaforo per far partire i figli
+	proc_sem = mmap(NULL, // NULL: è il kernel a scegliere l'indirizzo
+			sizeof(sem_t), // dimensione della memory map
+			PROT_READ | PROT_WRITE, // memory map leggibile e scrivibile
+			MAP_SHARED | MAP_ANONYMOUS, // memory map condivisibile con altri processi e senza file di appoggio
+			-1, 0); // offset nel file
+
+	CHECK_ERR_MMAP(proc_sem, "mmap")
+
+	//"mutex" per accedere al file
+	gettone = mmap(NULL, // NULL: è il kernel a scegliere l'indirizzo
+			sizeof(sem_t), // dimensione della memory map
+			PROT_READ | PROT_WRITE, // memory map leggibile e scrivibile
+			MAP_SHARED | MAP_ANONYMOUS, // memory map condivisibile con altri processi e senza file di appoggio
+			-1, 0); // offset nel file
+
+	//padre inizializza il mutex
+	res = sem_init(gettone, 1, // 1 => il semaforo è condiviso tra processi, 0 => il semaforo è condiviso tra threads del processo
+			1 // valore iniziale del semaforo
+			);
+
+	CHECK_ERR(res, "sem_init")
+
+	//crea i processi figli
+	for (int i = 0; i < N; i++) {
+		switch (fork()) {
+		case -1:
+			perror("fork()");
+			exit(EXIT_FAILURE);
+		case 0: //qui dentro è dove sono presenti i figli
+			child_process_A(i);
+			break;
+		default:
+			;
+		}
+	}
+
+	//incrementa il semaforo
+	for (int i = 0; i < N + FILE_SIZE; i++) {
+		if (sem_post(proc_sem) == -1) {
+			perror("sem_post");
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	do {
+		res = wait(NULL);
+
+		if (res > 0) {
+			printf("Messaggio dal padre: è appena arrivato un figlio\n");
+		}
+
+	} while (res != -1); //non è il massimo, così non riconosco evntauli failure di wait
+
+	res = sem_destroy(proc_sem);
+
+	CHECK_ERR(res, "sem_destroy")
+
+	res = munmap(proc_sem, sizeof(sem_t));
+
+	CHECK_ERR(res, "munmap")
+
+}
+
+void child_process_B(int n_figlio, char *addr) {
+
+	int bytes = 0;
+
+	int posiz=0;
+
+	while (1) {
+
+		//passo al segnale del padre
+		if (sem_wait(proc_sem) == -1) {
+			perror("sem_wait");
+			exit(EXIT_FAILURE);
+		}
+
+		//prendo il mutex
+		if (sem_wait(gettone) == -1) {
+			perror("sem_wait");
+			exit(EXIT_FAILURE);
+		}
+
+		//printf("Figlio %d: preso il mutex\n", n_figlio);
+
+		for(int i=posiz; i<FILE_SIZE; i++){
+
+			if( i == (FILE_SIZE-1) ) { //sono arrivato in fondo al file senza trovare spazi liberi
+				printf("Figlio %d: ho fatto il mio mestiere, ho scritto %d volte\n", n_figlio, bytes);
+				if (sem_post(gettone) == -1) {
+					perror("sem_post");
+					exit(EXIT_FAILURE);
+				}
+				exit(EXIT_SUCCESS);
+			}
+
+			if ( addr[i] == '\0') {
+				posiz=i;
+				addr[i]='A'+n_figlio;
+				//printf("Figlio %d: ho scritto %c nella posizione %d\n", n_figlio, 'A'+n_figlio, posiz);
+				bytes++;
+				i=(FILE_SIZE);//ho scritto un byte, ora torno al punto di partenza e aspetto il prox segnale dal padre
+			}
+
+			//printf("Figlio %d: ho scritto ora torno al punto di partenza\n", n_figlio);
+		}
+
+		if (sem_post(gettone) == -1) {
 			perror("sem_post");
 			exit(EXIT_FAILURE);
 		}
 
 	}
 
-	close(fd);
-
-	printf("[child %d] bye  write_counter=%d\n", i, write_counter);
-
-	exit(EXIT_SUCCESS);
 }
 
+void soluzione_B(void) {
+
+	int fd;
+	int res;
+	char *addr;
+
+	//padre crea il file e prepara la memorymap con all'interno il file
+	fd = open("output_B.txt",
+	O_CREAT | O_TRUNC | O_RDWR,
+	S_IRUSR | S_IWUSR // l'utente proprietario del file avrà i permessi di lettura e scrittura sul nuovo file
+	);
+
+	CHECK_ERR(fd, "open")
+
+	res = ftruncate(fd, FILE_SIZE);
+
+	CHECK_ERR(fd, "ftruncate")
+
+	addr = mmap(NULL, // NULL: è il kernel a scegliere l'indirizzo
+			FILE_SIZE, // dimensione della memory map
+			PROT_READ | PROT_WRITE, // memory map leggibile e scrivibile
+			MAP_SHARED, // memory map condivisibile con altri processi
+			fd, 0); // offset nel file
+
+	CHECK_ERR_MMAP(addr, "mmap")
+
+	res = close(fd);
+
+	CHECK_ERR(res, "close")
+
+	//semaforo per far partire i figli
+	proc_sem = mmap(NULL, // NULL: è il kernel a scegliere l'indirizzo
+			sizeof(sem_t), // dimensione della memory map
+			PROT_READ | PROT_WRITE, // memory map leggibile e scrivibile
+			MAP_SHARED | MAP_ANONYMOUS, // memory map condivisibile con altri processi e senza file di appoggio
+			-1, 0); // offset nel file
+
+	CHECK_ERR_MMAP(proc_sem, "mmap")
+
+	//"mutex" per accedere al file
+	gettone = mmap(NULL, // NULL: è il kernel a scegliere l'indirizzo
+			sizeof(sem_t), // dimensione della memory map
+			PROT_READ | PROT_WRITE, // memory map leggibile e scrivibile
+			MAP_SHARED | MAP_ANONYMOUS, // memory map condivisibile con altri processi e senza file di appoggio
+			-1, 0); // offset nel file
+
+	//padre inizializza il mutex
+	res = sem_init(gettone, 1, // 1 => il semaforo è condiviso tra processi, 0 => il semaforo è condiviso tra threads del processo
+			1 // valore iniziale del semaforo
+			);
+
+	CHECK_ERR(res, "sem_init")
+
+	//crea i processi figli
+	for (int i = 0; i < N; i++) {
+		switch (fork()) {
+		case -1:
+			perror("fork()");
+			exit(EXIT_FAILURE);
+		case 0: //qui dentro è dove sono presenti i figli
+			child_process_B(i, addr);
+			break;
+		default:
+			;
+		}
+	}
+
+	//incrementa il semaforo
+	for (int i = 0; i < N + FILE_SIZE; i++) {
+		if (sem_post(proc_sem) == -1) {
+			perror("sem_post");
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	do {
+		res = wait(NULL);
+
+		if (res > 0) {
+			printf("Messaggio dal padre: è appena arrivato un figlio\n");
+		}
+
+	} while (res != -1); //non è il massimo, così non riconosco evntauli failure di wait
+
+	res = sem_destroy(proc_sem);
+
+	CHECK_ERR(res, "sem_destroy")
+
+	res = munmap(proc_sem, sizeof(sem_t));
+
+	CHECK_ERR(res, "munmap")
+
+	res = munmap(addr, FILE_SIZE);
+}
+
+int main() {
+	printf("ora avvio la soluzione_A()...\n");
+	soluzione_A();
+
+	printf("ed ora avvio la soluzione_B()...\n");
+	soluzione_B();
+
+	printf("bye!\n");
+	return 0;
+}
 
